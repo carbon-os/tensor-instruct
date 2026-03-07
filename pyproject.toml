@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "tensor-instruct"
+version = "1.0.0"
+description = "Instruct fine-tuning on raw base models. Point it at your data, get a production instruct model back."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+keywords = [
+    "llm", "fine-tuning", "instruct", "chatml", "transformers",
+    "machine learning", "tensor-framework"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.2.0",
+    "transformers>=4.47.0",
+    "datasets>=2.18.0",
+    "accelerate>=0.30.0",
+    "huggingface_hub>=0.22.0",
+    "safetensors>=0.4.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+flash-attn = [
+    "flash-attn>=2.5.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-timeout>=2.3.0",
+    "ruff>=0.4.0",
+    "mypy>=1.9.0",
+]
+
+[project.urls]
+Homepage      = "https://github.com/carbon-os/tensor-instruct"
+Documentation = "https://github.com/carbon-os/tensor-instruct#readme"
+Repository    = "https://github.com/carbon-os/tensor-instruct"
+Issues        = "https://github.com/carbon-os/tensor-instruct/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tensor*"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]
+
+# ── Ruff ──────────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]
+
+# ── Mypy ─────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true
+
+# ── Pytest ────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120
