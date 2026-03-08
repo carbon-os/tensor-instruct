@@ -59,6 +59,8 @@ conda --version
 Always create a dedicated conda environment — never install into `base` as it
 is reserved for conda's own tooling and will cause conflicts.
 ```bash
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
 conda create -n tensor python=3.12 -y
 conda activate tensor
 ```

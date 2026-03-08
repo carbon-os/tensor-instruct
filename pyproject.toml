@@ -36,29 +36,15 @@ dependencies = [
     "sentencepiece>=0.2.0",
     "protobuf>=4.25.0",
     "tiktoken>=0.7.0",
+    "psutil>=5.9.0",
 ]
 
 [project.optional-dependencies]
-# FlashAttention-2 — must be installed AFTER torch:
+# FlashAttention-2 — install AFTER torch:
 #   pip install -e ".[flash-attn]" --no-build-isolation
+# Supported on A100 SXM (sm_80) and L40S (sm_89). Auto-detected at runtime.
 flash-attn = [
     "flash-attn>=2.5.0",
-]
-# Blackwell / Hopper: FP8 training via NVIDIA Transformer Engine
-fp8 = [
-    "transformer-engine>=1.7.0",
-]
-# Blackwell: FlashAttention-3 (experimental, requires CUDA 12.3+)
-# Install AFTER torch:
-#   pip install -e ".[flash-attn-3]" --no-build-isolation
-flash-attn-3 = [
-    "flash-attn-3>=0.0.1",
-]
-# Pro 6000 / H100 base install (no flash-attn — install that separately):
-#   pip install -e ".[blackwell]"
-#   pip install flash-attn --no-build-isolation
-blackwell = [
-    "transformer-engine>=1.7.0",
 ]
 dev = [
     "pytest>=8.0.0",
