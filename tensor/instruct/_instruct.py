@@ -1,5 +1,24 @@
 """
 Instruct — the main entry point for tensor-instruct.
+
+Usage
+-----
+.. code-block:: python
+
+    from tensor.instruct import Instruct, InstructConfig
+
+    run = Instruct(
+        base="./output/my-pretrained-base",
+        data="./my-chats.jsonl",
+        output="./output/my-instruct-model",
+        config=InstructConfig(epochs=3, devices=4),
+    )
+
+    run.validate()
+    run.estimate()
+    run.train()
+
+    print(run.result)
 """
 
 from __future__ import annotations
@@ -47,7 +66,7 @@ def _detect_gpu() -> dict:
     name          : str   — GPU name as reported by CUDA
     vram_gb       : float — total VRAM in GB
     free_vram_gb  : float — free VRAM in GB
-    is_blackwell  : bool  — Blackwell architecture (sm_100 / compute cap 10.x)
+    is_blackwell  : bool  — Blackwell architecture (compute cap 10.x)
     is_hopper     : bool  — Hopper architecture (sm_90)
     is_ampere     : bool  — Ampere architecture (sm_80 / sm_86)
     is_ada        : bool  — Ada Lovelace architecture (sm_89)
@@ -70,10 +89,10 @@ def _detect_gpu() -> dict:
         if not torch.cuda.is_available():
             return info
 
-        props          = torch.cuda.get_device_properties(0)
-        major, minor   = props.major, props.minor
-        total_bytes    = props.total_memory
-        free_bytes, _  = torch.cuda.mem_get_info(0)
+        props         = torch.cuda.get_device_properties(0)
+        major, minor  = props.major, props.minor
+        total_bytes   = props.total_memory
+        free_bytes, _ = torch.cuda.mem_get_info(0)
 
         info["name"]         = props.name
         info["vram_gb"]      = total_bytes / (1024 ** 3)
@@ -83,7 +102,7 @@ def _detect_gpu() -> dict:
         info["is_hopper"]    = major == 9
         info["is_ampere"]    = major == 8 and minor in (0, 6)
         info["is_ada"]       = major == 8 and minor == 9
-        info["has_fp8"]      = major >= 9          # Hopper and Blackwell
+        info["has_fp8"]      = major >= 9
 
     except Exception:
         pass
@@ -269,7 +288,7 @@ class Instruct:
 
         model = AutoModelForCausalLM.from_pretrained(
             self._base_model_id,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             attn_implementation=attn_impl,
             trust_remote_code=False,
         )
@@ -283,8 +302,8 @@ class Instruct:
             model = _wrap_fp8(model)
             fp8_active = True
 
-        # ── 7. Compile model ───────────────────────────────────────────────
-        if _should_compile():
+        # ── 7. Compile model (only on GPUs with enough VRAM) ──────────────
+        if _should_compile(gpu):
             compile_mode = "max_autotune" if gpu["sm_count"] >= 100 else "reduce-overhead"
             print(f"[tensor-instruct] Compiling model (mode={compile_mode}) …")
             model = torch.compile(model, mode=compile_mode)
@@ -305,6 +324,7 @@ class Instruct:
 
         self._output.mkdir(parents=True, exist_ok=True)
 
+        # Gradient checkpointing only needed when VRAM is tight.
         use_grad_ckpt = gpu["free_vram_gb"] < 40
 
         training_args = TrainingArguments(
@@ -534,13 +554,6 @@ def _ensure_chatml_tokens(tokenizer, model):
 
 
 def _resolve_dtype(config: InstructConfig, gpu: dict):
-    """
-    Pick the best torch dtype for the detected GPU.
-
-    Blackwell / Hopper with FP8 available → stay bfloat16 for the model
-    weights; FP8 is applied at the layer level by Transformer Engine, not
-    as a global dtype.  For everything else, honour the config dtype.
-    """
     return {
         "bfloat16": torch.bfloat16,
         "float16":  torch.float16,
@@ -558,7 +571,6 @@ def _resolve_context_length(config: InstructConfig, tokenizer, gpu: dict) -> int
 
     vram_gb = gpu["free_vram_gb"]
 
-    # Blackwell / large VRAM cards can handle long context comfortably.
     if gpu["is_blackwell"] or vram_gb >= 64:
         safe_ctx = 8192
     elif vram_gb >= 40:
@@ -572,12 +584,6 @@ def _resolve_context_length(config: InstructConfig, tokenizer, gpu: dict) -> int
 
 
 def _pick_attention_impl(gpu: dict) -> str:
-    """
-    Choose the best available attention implementation for the GPU.
-
-    Priority: FlashAttention-3 (Blackwell) > FlashAttention-2 > eager.
-    FA3 is still experimental — fall back to FA2 if the import fails.
-    """
     if gpu["is_blackwell"]:
         try:
             import flash_attn_3  # noqa: F401
@@ -603,13 +609,6 @@ def _transformer_engine_available() -> bool:
 
 
 def _wrap_fp8(model):
-    """
-    Wrap Linear layers in Transformer Engine FP8 equivalents.
-
-    This replaces torch.nn.Linear with te.Linear which uses FP8 Tensor
-    Cores on Hopper and Blackwell for forward and backward passes.
-    Requires: pip install transformer-engine
-    """
     try:
         import transformer_engine.pytorch as te
 
@@ -638,21 +637,25 @@ def _wrap_fp8(model):
     return model
 
 
-def _should_compile() -> bool:
+def _should_compile(gpu: dict) -> bool:
+    """
+    Only compile when CUDA is available, PyTorch >= 2.0, and there is
+    enough VRAM that CUDA graph private pools won't cause OOM.
+    Cards below 20 GB should skip compilation — the memory overhead of
+    CUDA graphs eats into already tight headroom.
+    """
     try:
         major = int(torch.__version__.split(".")[0])
-        return major >= 2 and torch.cuda.is_available()
+        return (
+            major >= 2
+            and torch.cuda.is_available()
+            and gpu["free_vram_gb"] >= 20
+        )
     except Exception:
         return False
 
 
 def _auto_batch_size(context_length: int, gpu: dict) -> int:
-    """
-    Pick a per-device batch size based on free VRAM and context length.
-
-    Blackwell (96 GB) can run much larger batches than the conservative
-    defaults tuned for 16 GB Ada cards.
-    """
     vram_gb = gpu["free_vram_gb"]
 
     if context_length >= 8192:
@@ -664,12 +667,12 @@ def _auto_batch_size(context_length: int, gpu: dict) -> int:
         if vram_gb >= 64:  return 16
         if vram_gb >= 40:  return 8
         if vram_gb >= 20:  return 4
-        return 2
+        return 1
     else:
         if vram_gb >= 64:  return 32
         if vram_gb >= 40:  return 16
         if vram_gb >= 20:  return 8
-        return 4
+        return 2      # was 4 — too aggressive for 16 GB
 
 
 def _check_model_accessible(model_id: str) -> None:
