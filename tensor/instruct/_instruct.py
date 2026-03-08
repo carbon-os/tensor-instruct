@@ -137,40 +137,6 @@ def _print_gpu_banner(gpu: dict) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Qwen3 RMSNorm CUDAGraph patch
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _patch_qwen3_rmsnorm() -> bool:
-    """
-    Monkey-patch Qwen3RMSNorm.forward to avoid CUDAGraph tensor overwrites
-    during torch.compile.
-
-    The upstream implementation reassigns the `hidden_states` variable to a
-    float32 cast, which causes CUDAGraphs to overwrite the original input
-    tensor on the backward pass. The fix is to use a separate variable for
-    the float32 intermediate so the original buffer is never touched.
-
-    Returns True if the patch was applied, False if the import failed.
-    """
-    try:
-        from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
-
-        def _patched_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            input_dtype = hidden_states.dtype
-            hidden_states_f32 = hidden_states.to(torch.float32)
-            variance = hidden_states_f32.pow(2).mean(-1, keepdim=True)
-            hidden_states_f32 = hidden_states_f32 * torch.rsqrt(
-                variance + self.variance_epsilon
-            )
-            return self.weight * hidden_states_f32.to(input_dtype)
-
-        Qwen3RMSNorm.forward = _patched_forward
-        return True
-    except Exception:
-        return False
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Instruct
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -344,30 +310,19 @@ class Instruct:
             fp8_active = True
 
         # ── 7. Compile model ───────────────────────────────────────────────
-        # Qwen3RMSNorm reassigns `hidden_states` to a float32 cast in-place,
-        # which causes CUDAGraphs to overwrite the original input tensor on
-        # the backward pass. We patch the forward method before compile to
-        # use a separate variable for the float32 intermediate so the
-        # original buffer is never touched. This is detected from config.json
-        # so it works for local paths as well as HF IDs.
-        _model_type = _get_model_type(self._base_model_id)
-        _is_qwen3   = "qwen3" in _model_type
-
         if _should_compile(gpu):
-            compile_mode = "max-autotune" if gpu["sm_count"] >= 100 else "reduce-overhead"
+            # CUDAGraphs (used by standard max-autotune) is notoriously
+            # incompatible with Qwen's RMSNorm and many other LLM layers that
+            # reuse buffers. We use 'max-autotune-no-cudagraphs' which keeps
+            # the Triton optimisations (fast kernels) but disables the
+            # graph capture (preventing the crash).
+            if gpu["sm_count"] >= 100:
+                compile_mode = "max-autotune-no-cudagraphs"
+            else:
+                compile_mode = "reduce-overhead"
 
-            if _is_qwen3:
-                patched = _patch_qwen3_rmsnorm()
-                if patched:
-                    print("[tensor-instruct] Applied Qwen3 RMSNorm CUDAGraph patch")
-                else:
-                    print(
-                        "[tensor-instruct] Qwen3 RMSNorm patch failed — skipping compile"
-                    )
-
-            if not _is_qwen3 or patched:
-                print(f"[tensor-instruct] Compiling model (mode={compile_mode}) …")
-                model = torch.compile(model, mode=compile_mode, dynamic=True)
+            print(f"[tensor-instruct] Compiling model (mode={compile_mode}) …")
+            model = torch.compile(model, mode=compile_mode, dynamic=True)
 
         # ── 8. Training arguments ──────────────────────────────────────────
         batch_size = self._config.batch_size_per_device or _auto_batch_size(
@@ -713,20 +668,15 @@ def _wrap_fp8(model):
 
 
 def _should_compile(gpu: dict) -> bool:
-    # sm_120 (Blackwell consumer) has unstable Triton support — skip.
-    if gpu["is_blackwell"]:
-        return False
-    # A100 SXM (sm_80, 108 SMs) and L40S (sm_89, 142 SMs) both have
-    # stable Triton/Inductor support. max-autotune is safe and recommended.
-    try:
-        major = int(torch.__version__.split(".")[0])
-        return (
-            major >= 2
-            and torch.cuda.is_available()
-            and gpu["free_vram_gb"] >= 20
-        )
-    except Exception:
-        return False
+    """
+    Determine if we should use torch.compile.
+    
+    On A100 (Ampere), Flash Attention 2 is natively supported and provides
+    most of the performance benefits. torch.compile is currently generating
+    invalid Triton kernels (illegal memory access) for this model config.
+    """
+    # Force disable compile to ensure stability
+    return False
 
 
 def _auto_batch_size(context_length: int, gpu: dict) -> int:
