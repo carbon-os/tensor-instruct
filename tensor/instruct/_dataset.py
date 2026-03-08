@@ -74,7 +74,6 @@ def _auto_max_examples() -> int | None:
         import psutil
         available_gb = psutil.virtual_memory().available / (1024 ** 3)
     except Exception:
-        # psutil unavailable — apply a safe default.
         return 25_000
 
     if available_gb < 8:
@@ -86,7 +85,7 @@ def _auto_max_examples() -> int | None:
     elif available_gb < 64:
         cap = 150_000
     else:
-        return None  # unlimited
+        return None
 
     return cap
 
@@ -129,11 +128,10 @@ def build_instruct_dataset(
     """
     import datasets as hf_datasets
 
-    # Resolve max_examples.
     if max_examples == "auto":
         resolved_cap = _auto_max_examples()
     else:
-        resolved_cap = max_examples  # None or explicit int
+        resolved_cap = max_examples
 
     if resolved_cap is not None:
         print(
@@ -143,10 +141,12 @@ def build_instruct_dataset(
     else:
         print("[tensor-instruct] Building tokenised dataset …  (cap: unlimited)")
 
+    # These counters are written inside the generator which runs in a
+    # subprocess when datasets materialises the arrow table, so they will
+    # always read zero after from_generator returns.  We keep them for the
+    # skipped/truncated detail lines but use len(dataset) for the kept count.
     stats = {"total": 0, "kept": 0, "truncated": 0, "skipped": 0}
 
-    # Log sources before entering the generator so the output appears
-    # immediately rather than only when the first example is consumed.
     for source, weight in sources.items():
         print(f"  → {source!r}  (weight {weight:.2f})")
 
@@ -186,10 +186,9 @@ def build_instruct_dataset(
             '{"messages": [{"role": ..., "content": ...}, ...]} schema.'
         )
 
-    print(
-        f"  ✓ {stats['kept']:,} examples kept  "
-        f"({stats['truncated']:,} truncated, {stats['skipped']:,} skipped)"
-    )
+    # Use len(dataset) for the kept count — the stats dict is populated inside
+    # a subprocess and will read zero in this process after from_generator.
+    print(f"  ✓ {len(dataset):,} examples ready for training")
 
     return dataset, stats
 
@@ -233,14 +232,11 @@ def _tokenize_conversation(
         if not role or content is None:
             continue
 
-        # Encode each segment separately so we can mask precisely.
         header_ids  = _encode(tokenizer, f"{_IM_START}{role}\n")
         content_ids = _encode(tokenizer, content)
         footer_ids  = _encode(tokenizer, f"{_IM_END}\n")
 
         if role in _TRAIN_ROLES:
-            # Compute loss on content and closing <|im_end|>.
-            # Header is context — no gradient.
             input_ids.extend(header_ids + content_ids + footer_ids)
             labels.extend(
                 [_IGNORE_INDEX] * len(header_ids)
@@ -248,7 +244,6 @@ def _tokenize_conversation(
                 + footer_ids
             )
         else:
-            # System / user turns: pure context, no gradient.
             segment = header_ids + content_ids + footer_ids
             input_ids.extend(segment)
             labels.extend([_IGNORE_INDEX] * len(segment))
@@ -256,7 +251,6 @@ def _tokenize_conversation(
     if not input_ids:
         return None
 
-    # Must have at least one trainable token before truncation.
     if not any(l != _IGNORE_INDEX for l in labels):
         return None
 
@@ -264,7 +258,6 @@ def _tokenize_conversation(
     input_ids = input_ids[:context_length]
     labels    = labels[:context_length]
 
-    # After truncation all trainable tokens may have been cut off.
     if all(l == _IGNORE_INDEX for l in labels):
         return None
 

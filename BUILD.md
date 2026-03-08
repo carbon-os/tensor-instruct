@@ -43,6 +43,12 @@ source .venv/bin/activate        # Linux / macOS
 ```bash
 pip install --upgrade pip setuptools
 pip install -e .
+
+OR
+
+# RTX Pro 6000
+pip install -e ".[blackwell]"
+
 ```
 
 The `-e` flag installs in editable mode — changes to the source files take

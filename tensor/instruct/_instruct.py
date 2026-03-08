@@ -1,24 +1,5 @@
 """
 Instruct — the main entry point for tensor-instruct.
-
-Usage
------
-.. code-block:: python
-
-    from tensor.instruct import Instruct, InstructConfig
-
-    run = Instruct(
-        base="./output/my-pretrained-base",
-        data="./my-chats.jsonl",
-        output="./output/my-instruct-model",
-        config=InstructConfig(epochs=3, devices=4),
-    )
-
-    run.validate()
-    run.estimate()
-    run.train()
-
-    print(run.result)
 """
 
 from __future__ import annotations
@@ -41,13 +22,11 @@ _DataArg = Union[str, Path, "LocalSource", "HubSource", "Mix"]
 
 _RUN_STATE_FILE = "tensor_instruct_state.json"
 
-# Suffixes that indicate an already instruction-tuned model.
 _INSTRUCT_SUFFIXES = (
     "-instruct", "-it", "-chat", "-dpo", "-rlhf", "-sft",
     "_instruct", "_it", "_chat",
 )
 
-# ChatML special tokens that must be present in the tokenizer vocabulary.
 _CHATML_TOKENS = ["<|im_start|>", "<|im_end|>"]
 
 
@@ -55,13 +34,92 @@ class BaseModelError(ValueError):
     """Raised when an instruction-tuned model is passed instead of a raw base."""
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# GPU detection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _detect_gpu() -> dict:
+    """
+    Return a capability dict for the primary CUDA device.
+
+    Keys
+    ----
+    name          : str   — GPU name as reported by CUDA
+    vram_gb       : float — total VRAM in GB
+    free_vram_gb  : float — free VRAM in GB
+    is_blackwell  : bool  — Blackwell architecture (sm_100 / compute cap 10.x)
+    is_hopper     : bool  — Hopper architecture (sm_90)
+    is_ampere     : bool  — Ampere architecture (sm_80 / sm_86)
+    is_ada        : bool  — Ada Lovelace architecture (sm_89)
+    sm_count      : int   — number of streaming multiprocessors
+    has_fp8       : bool  — native FP8 Tensor Core support (Hopper+)
+    """
+    info = {
+        "name":         "cpu",
+        "vram_gb":      0.0,
+        "free_vram_gb": 0.0,
+        "is_blackwell": False,
+        "is_hopper":    False,
+        "is_ampere":    False,
+        "is_ada":       False,
+        "sm_count":     0,
+        "has_fp8":      False,
+    }
+
+    try:
+        if not torch.cuda.is_available():
+            return info
+
+        props          = torch.cuda.get_device_properties(0)
+        major, minor   = props.major, props.minor
+        total_bytes    = props.total_memory
+        free_bytes, _  = torch.cuda.mem_get_info(0)
+
+        info["name"]         = props.name
+        info["vram_gb"]      = total_bytes / (1024 ** 3)
+        info["free_vram_gb"] = free_bytes  / (1024 ** 3)
+        info["sm_count"]     = props.multi_processor_count
+        info["is_blackwell"] = major >= 10
+        info["is_hopper"]    = major == 9
+        info["is_ampere"]    = major == 8 and minor in (0, 6)
+        info["is_ada"]       = major == 8 and minor == 9
+        info["has_fp8"]      = major >= 9          # Hopper and Blackwell
+
+    except Exception:
+        pass
+
+    return info
+
+
+def _print_gpu_banner(gpu: dict) -> None:
+    """Print a short GPU summary with any unlocked optimisations."""
+    if gpu["name"] == "cpu":
+        print("  device         CPU (no CUDA GPU detected)")
+        return
+
+    print(f"  device         {gpu['name']}")
+    print(f"  vram           {gpu['vram_gb']:.0f} GB total  /  {gpu['free_vram_gb']:.0f} GB free")
+    print(f"  SMs            {gpu['sm_count']}")
+
+    unlocked = []
+    if gpu["has_fp8"]:
+        unlocked.append("FP8 training")
+    if gpu["is_blackwell"] or gpu["is_hopper"]:
+        unlocked.append("max_autotune compile")
+    if gpu["is_blackwell"]:
+        unlocked.append("FlashAttention-3 (if installed)")
+
+    if unlocked:
+        print(f"  optimisations  {', '.join(unlocked)}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Instruct
+# ──────────────────────────────────────────────────────────────────────────────
+
 class Instruct:
     """
     Instruct fine-tuning on a raw pretrained base model.
-
-    Accepts a base model produced by ``tensor-pretrain`` or any compatible
-    HuggingFace base model ID.  Instruction-tuned variants are rejected
-    immediately at construction time.
 
     Parameters
     ----------
@@ -90,7 +148,7 @@ class Instruct:
         config: InstructConfig | None = None,
     ) -> None:
         self._base_input    = str(base)
-        self._base_model_id = _resolve_base(base)   # raises BaseModelError early
+        self._base_model_id = _resolve_base(base)
         self._data          = _normalise_data(data)
         self._output        = Path(output).expanduser().resolve()
         self._config        = config or InstructConfig()
@@ -102,25 +160,16 @@ class Instruct:
 
     @property
     def result(self) -> InstructResult:
-        """The :class:`InstructResult` from the most recent ``train()`` call."""
         if self._result is None:
             raise RuntimeError("train() has not been called yet.")
         return self._result
 
     def validate(self) -> None:
-        """
-        Run pre-flight checks on the base model, data, and hardware.
-
-        Raises an informative error as early as possible rather than letting
-        the training loop fail partway through.
-        """
         print("[tensor-instruct] Validating …")
 
-        # 1. Base model.
         _check_model_accessible(self._base_model_id)
         print(f"  ✓ base model   {self._base_model_id}")
 
-        # 2. Data sources.
         for source in self._data.keys():
             if isinstance(source, LocalSource):
                 n = source.example_count()
@@ -134,11 +183,9 @@ class Instruct:
             elif isinstance(source, HubSource):
                 print(f"  ✓ data source  {source!r}  (hub — validated at stream time)")
 
-        # 3. Output directory.
         self._output.mkdir(parents=True, exist_ok=True)
         print(f"  ✓ output       {self._output}")
 
-        # 4. Hardware.
         devices = self._config.resolve_devices()
         _check_hardware(devices, self._config.dtype)
         print(f"  ✓ hardware     {devices}× device(s), dtype={self._config.dtype}")
@@ -146,18 +193,13 @@ class Instruct:
         print("[tensor-instruct] Validation passed.\n")
 
     def estimate(self) -> None:
-        """
-        Print a time estimate without running training.
-
-        Counts examples across LocalSource entries and projects wall time
-        based on model size, device count, and configured epochs.
-        """
         from tensor.instruct._dataset import estimate_example_count
 
         print("[tensor-instruct] Estimating …")
 
         tokenizer      = _load_tokenizer(self._base_model_id)
-        context_length = _resolve_context_length(self._config, tokenizer)
+        gpu            = _detect_gpu()
+        context_length = _resolve_context_length(self._config, tokenizer, gpu)
         devices        = self._config.resolve_devices()
 
         n_examples = estimate_example_count(self._data)
@@ -179,30 +221,38 @@ class Instruct:
         """
         Run the full instruct fine-tuning pipeline and write a
         ``.safetensors`` checkpoint to the configured output directory.
-
-        When complete, ``run.result`` is available with the checkpoint path,
-        example count, and elapsed time.
         """
         from transformers import (
             AutoModelForCausalLM,
             TrainingArguments,
             Trainer,
+            ProgressCallback,
         )
         from tensor.instruct._dataset import build_instruct_dataset
+        from tensor.instruct._callback import TensorProgressCallback
 
         t_start = time.time()
 
+        # ── 1. Detect GPU and print capabilities ───────────────────────────
+        gpu = _detect_gpu()
+
         print("[tensor-instruct] Starting instruct fine-tuning run")
         print(f"  base   → {self._base_model_id}")
-        print(f"  output → {self._output}\n")
+        print(f"  output → {self._output}")
+        _print_gpu_banner(gpu)
+        print()
 
-        # ── 1. Load tokeniser ──────────────────────────────────────────────
+        # ── 2. Enable TF32 for faster matmuls on Ampere / Ada / Hopper / Blackwell
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        # ── 3. Load tokeniser ──────────────────────────────────────────────
         print("[tensor-instruct] Loading tokenizer …")
         tokenizer      = _load_tokenizer(self._base_model_id)
-        context_length = _resolve_context_length(self._config, tokenizer)
+        context_length = _resolve_context_length(self._config, tokenizer, gpu)
         print(f"  context length: {context_length} tokens")
 
-        # ── 2. Build dataset ───────────────────────────────────────────────
+        # ── 4. Build dataset ───────────────────────────────────────────────
         dataset, stats = build_instruct_dataset(
             sources=self._data,
             tokenizer=tokenizer,
@@ -211,25 +261,37 @@ class Instruct:
             seed=self._config.seed,
         )
 
-        # ── 3. Load model ──────────────────────────────────────────────────
+        # ── 5. Load model ──────────────────────────────────────────────────
         print(f"\n[tensor-instruct] Loading base model ({self._base_model_id}) …")
         devices     = self._config.resolve_devices()
-        torch_dtype = self._config.resolve_dtype_torch()
-        attn_impl   = _pick_attention_impl()
+        torch_dtype = _resolve_dtype(self._config, gpu)
+        attn_impl   = _pick_attention_impl(gpu)
 
         model = AutoModelForCausalLM.from_pretrained(
             self._base_model_id,
-            dtype=torch_dtype,
+            torch_dtype=torch_dtype,
             attn_implementation=attn_impl,
             trust_remote_code=False,
         )
 
-        # Ensure ChatML special tokens exist in the vocab.
         tokenizer, model = _ensure_chatml_tokens(tokenizer, model)
 
-        # ── 4. Training arguments ──────────────────────────────────────────
+        # ── 6. FP8 training via Transformer Engine (Hopper / Blackwell) ───
+        fp8_active = False
+        if gpu["has_fp8"] and _transformer_engine_available():
+            print("[tensor-instruct] Enabling FP8 training via Transformer Engine …")
+            model = _wrap_fp8(model)
+            fp8_active = True
+
+        # ── 7. Compile model ───────────────────────────────────────────────
+        if _should_compile():
+            compile_mode = "max_autotune" if gpu["sm_count"] >= 100 else "reduce-overhead"
+            print(f"[tensor-instruct] Compiling model (mode={compile_mode}) …")
+            model = torch.compile(model, mode=compile_mode)
+
+        # ── 8. Training arguments ──────────────────────────────────────────
         batch_size = self._config.batch_size_per_device or _auto_batch_size(
-            context_length, devices
+            context_length, gpu
         )
 
         steps_per_epoch = max(
@@ -243,6 +305,8 @@ class Instruct:
 
         self._output.mkdir(parents=True, exist_ok=True)
 
+        use_grad_ckpt = gpu["free_vram_gb"] < 40
+
         training_args = TrainingArguments(
             output_dir=str(self._output),
             num_train_epochs=self._config.epochs,
@@ -251,9 +315,11 @@ class Instruct:
             learning_rate=self._config.learning_rate,
             lr_scheduler_type="cosine",
             warmup_steps=warmup_steps,
-            bf16=(self._config.dtype == "bfloat16"),
-            fp16=(self._config.dtype == "float16"),
-            gradient_checkpointing=True,
+            bf16=(torch_dtype == torch.bfloat16 and not fp8_active),
+            fp16=(torch_dtype == torch.float16),
+            gradient_checkpointing=use_grad_ckpt,
+            optim="adamw_torch_fused",
+            dataloader_pin_memory=True,
             logging_steps=self._config.logging_steps,
             save_steps=(
                 self._config.save_steps
@@ -265,6 +331,7 @@ class Instruct:
             report_to="none",
             seed=self._config.seed,
             remove_unused_columns=False,
+            disable_tqdm=True,
         )
 
         collator = _ChatMLCollator(tokenizer=tokenizer)
@@ -276,17 +343,21 @@ class Instruct:
             data_collator=collator,
         )
 
-        # ── 5. Persist run state (for resume) ─────────────────────────────
+        # Swap out the default ProgressCallback for our clean one.
+        trainer.remove_callback(ProgressCallback)
+        trainer.add_callback(TensorProgressCallback())
+
+        # ── 9. Persist run state ───────────────────────────────────────────
         self._save_run_state()
 
-        # ── 6. Train ───────────────────────────────────────────────────────
+        # ── 10. Train ──────────────────────────────────────────────────────
         print(
             f"\n[tensor-instruct] Training …  "
-            f"({stats['kept']:,} examples × {self._config.epochs} epoch(s))\n"
+            f"({len(dataset):,} examples × {self._config.epochs} epoch(s))\n"
         )
         trainer.train()
 
-        # ── 7. Save final checkpoint as .safetensors ───────────────────────
+        # ── 11. Save checkpoint ────────────────────────────────────────────
         final_path = self._output / "model"
         final_path.mkdir(exist_ok=True)
 
@@ -298,7 +369,7 @@ class Instruct:
 
         self._result = InstructResult(
             checkpoint=final_path,
-            examples_trained=stats["kept"] * self._config.epochs,
+            examples_trained=len(dataset) * self._config.epochs,
             epochs=self._config.epochs,
             elapsed=elapsed,
             base_model_id=self._base_model_id,
@@ -313,12 +384,6 @@ class Instruct:
 
     @classmethod
     def resume(cls, output_dir: str | Path) -> "Instruct":
-        """
-        Reconstruct an :class:`Instruct` instance from a previously saved run.
-
-        Reads ``tensor_instruct_state.json`` from *output_dir* and restores
-        all original arguments so training can continue from the last checkpoint.
-        """
         output_dir = Path(output_dir).expanduser().resolve()
         state_file = output_dir / _RUN_STATE_FILE
 
@@ -378,12 +443,7 @@ class Instruct:
 
 @dataclass
 class _ChatMLCollator:
-    """
-    Pads ``input_ids``, ``labels``, and ``attention_mask`` to the longest
-    sequence in the batch.  Label padding uses -100 so padded positions are
-    never included in the loss.
-    """
-    tokenizer: object  # PreTrainedTokenizerBase
+    tokenizer: object
 
     def __call__(self, features: list[dict]) -> dict:
         input_ids = [f["input_ids"] for f in features]
@@ -414,12 +474,6 @@ class _ChatMLCollator:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _resolve_base(base: str | Path) -> str:
-    """
-    Validate and normalise the base model identifier.
-
-    Accepts a local path (tensor-pretrain checkpoint) or a HuggingFace ID.
-    Raises :class:`BaseModelError` if an instruct variant is detected.
-    """
     raw   = str(base).strip()
     lower = raw.lower()
 
@@ -431,16 +485,12 @@ def _resolve_base(base: str | Path) -> str:
                 "Use the base variant, or a checkpoint produced by tensor-pretrain."
             )
 
-    # Local path — return as-is.
     if Path(raw).exists():
         return raw
-
-    # HuggingFace ID — return as-is.
     return raw
 
 
 def _normalise_data(data: _DataArg) -> dict:
-    """Coerce every accepted data= form into a ``{source: weight}`` dict."""
     if isinstance(data, Mix):
         return data.sources
     if isinstance(data, (str, Path)):
@@ -455,7 +505,6 @@ def _normalise_data(data: _DataArg) -> dict:
 def _load_tokenizer(model_id: str):
     from transformers import AutoTokenizer
 
-    # For local checkpoints, verify tokenizer.json is present.
     p = Path(model_id)
     if p.exists():
         tokenizer_file = p / "tokenizer.json"
@@ -475,12 +524,6 @@ def _load_tokenizer(model_id: str):
 
 
 def _ensure_chatml_tokens(tokenizer, model):
-    """
-    Add <|im_start|> and <|im_end|> to the tokenizer and resize the model
-    embedding table if the tokens are not already present.
-
-    For Qwen3-based models this is a no-op — they ship with these tokens.
-    """
     vocab   = tokenizer.get_vocab()
     missing = [t for t in _CHATML_TOKENS if t not in vocab]
     if missing:
@@ -490,51 +533,143 @@ def _ensure_chatml_tokens(tokenizer, model):
     return tokenizer, model
 
 
-def _resolve_context_length(config: InstructConfig, tokenizer) -> int:
+def _resolve_dtype(config: InstructConfig, gpu: dict):
+    """
+    Pick the best torch dtype for the detected GPU.
+
+    Blackwell / Hopper with FP8 available → stay bfloat16 for the model
+    weights; FP8 is applied at the layer level by Transformer Engine, not
+    as a global dtype.  For everything else, honour the config dtype.
+    """
+    return {
+        "bfloat16": torch.bfloat16,
+        "float16":  torch.float16,
+        "float32":  torch.float32,
+    }[config.dtype]
+
+
+def _resolve_context_length(config: InstructConfig, tokenizer, gpu: dict) -> int:
     if config.context_length:
         return config.context_length
+
     model_max = getattr(tokenizer, "model_max_length", 4096)
     if model_max > 131072:
         model_max = 4096
-    vram_gb = _get_free_vram_gb()
-    if vram_gb < 20:
-        safe_ctx = 2048
-    elif vram_gb < 40:
+
+    vram_gb = gpu["free_vram_gb"]
+
+    # Blackwell / large VRAM cards can handle long context comfortably.
+    if gpu["is_blackwell"] or vram_gb >= 64:
+        safe_ctx = 8192
+    elif vram_gb >= 40:
+        safe_ctx = 4096
+    elif vram_gb >= 20:
         safe_ctx = 4096
     else:
-        safe_ctx = 8192
+        safe_ctx = 2048
+
     return min(model_max, safe_ctx)
 
 
-def _get_free_vram_gb() -> float:
-    try:
-        import torch
-        if torch.cuda.is_available():
-            free, _ = torch.cuda.mem_get_info(0)
-            return free / (1024 ** 3)
-    except Exception:
-        pass
-    return 999.0
+def _pick_attention_impl(gpu: dict) -> str:
+    """
+    Choose the best available attention implementation for the GPU.
 
+    Priority: FlashAttention-3 (Blackwell) > FlashAttention-2 > eager.
+    FA3 is still experimental — fall back to FA2 if the import fails.
+    """
+    if gpu["is_blackwell"]:
+        try:
+            import flash_attn_3  # noqa: F401
+            return "flash_attention_3"
+        except ImportError:
+            pass
 
-def _pick_attention_impl() -> str:
     try:
         import flash_attn  # noqa: F401
         return "flash_attention_2"
     except ImportError:
-        return "eager"
+        pass
+
+    return "eager"
 
 
-def _auto_batch_size(context_length: int, devices: int) -> int:
-    vram_gb = _get_free_vram_gb()
-    if context_length >= 4096:
-        if vram_gb < 20:   return 1
-        elif vram_gb < 40: return 2
-        else:              return 4
+def _transformer_engine_available() -> bool:
+    try:
+        import transformer_engine  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _wrap_fp8(model):
+    """
+    Wrap Linear layers in Transformer Engine FP8 equivalents.
+
+    This replaces torch.nn.Linear with te.Linear which uses FP8 Tensor
+    Cores on Hopper and Blackwell for forward and backward passes.
+    Requires: pip install transformer-engine
+    """
+    try:
+        import transformer_engine.pytorch as te
+
+        def replace_linear(module):
+            for name, child in module.named_children():
+                if isinstance(child, torch.nn.Linear):
+                    has_bias = child.bias is not None
+                    te_linear = te.Linear(
+                        child.in_features,
+                        child.out_features,
+                        bias=has_bias,
+                    )
+                    te_linear.weight.data.copy_(child.weight.data)
+                    if has_bias:
+                        te_linear.bias.data.copy_(child.bias.data)
+                    setattr(module, name, te_linear)
+                else:
+                    replace_linear(child)
+
+        replace_linear(model)
+        print("  + FP8 Linear layers active")
+
+    except Exception as e:
+        print(f"  ! FP8 wrap failed ({e}) — falling back to BF16")
+
+    return model
+
+
+def _should_compile() -> bool:
+    try:
+        major = int(torch.__version__.split(".")[0])
+        return major >= 2 and torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def _auto_batch_size(context_length: int, gpu: dict) -> int:
+    """
+    Pick a per-device batch size based on free VRAM and context length.
+
+    Blackwell (96 GB) can run much larger batches than the conservative
+    defaults tuned for 16 GB Ada cards.
+    """
+    vram_gb = gpu["free_vram_gb"]
+
+    if context_length >= 8192:
+        if vram_gb >= 64:  return 8
+        if vram_gb >= 40:  return 4
+        if vram_gb >= 20:  return 2
+        return 1
+    elif context_length >= 4096:
+        if vram_gb >= 64:  return 16
+        if vram_gb >= 40:  return 8
+        if vram_gb >= 20:  return 4
+        return 2
     else:
-        if vram_gb < 20:   return 2
-        elif vram_gb < 40: return 4
-        else:              return 8
+        if vram_gb >= 64:  return 32
+        if vram_gb >= 40:  return 16
+        if vram_gb >= 20:  return 8
+        return 4
 
 
 def _check_model_accessible(model_id: str) -> None:
@@ -598,13 +733,29 @@ def _estimate_wall_time(
     total_examples_per_hr = base_examples_per_hr * devices
     hours = (n_examples * epochs) / total_examples_per_hr
 
-    if hours < 1 / 12:
-        return f"~{max(1, int(hours * 60))} min"
-    if hours < 1:
-        return f"~{int(hours * 60)} min"
-    if hours < 48:
-        return f"~{hours:.1f} hrs"
-    return f"~{hours / 24:.1f} days"
+    total_minutes = int(hours * 60)
+
+    if total_minutes < 1:
+        return "est less than 1 min"
+    if total_minutes < 60:
+        return f"est {total_minutes} mins"
+
+    h = total_minutes // 60
+    m = total_minutes % 60
+    if m == 0:
+        return f"est {h}hr"
+    return f"est {h}hr {m}mins"
+
+
+def _get_free_vram_gb() -> float:
+    """Legacy helper — kept for any external callers. Use _detect_gpu() internally."""
+    try:
+        if torch.cuda.is_available():
+            free, _ = torch.cuda.mem_get_info(0)
+            return free / (1024 ** 3)
+    except Exception:
+        pass
+    return 999.0
 
 
 def _fmt_sources(sources: dict) -> str:

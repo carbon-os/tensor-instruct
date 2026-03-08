@@ -24,6 +24,11 @@ class InstructConfig:
     ----------
     epochs:
         Number of full passes over the training dataset.
+    max_examples:
+        Maximum number of training examples to use.
+        ``"auto"`` — derive a safe cap from available system RAM (default).
+        ``None``   — no cap, use all examples (safe only on high-RAM machines).
+        ``int``    — explicit cap, e.g. ``50_000``.
     devices:
         Number of GPUs to use.  ``None`` = all visible GPUs, or CPU if none.
     dtype:
@@ -52,6 +57,7 @@ class InstructConfig:
     """
 
     epochs: int = 3
+    max_examples: int | str | None = "auto"
     devices: int | None = None
     dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     context_length: int | None = None
@@ -76,6 +82,6 @@ class InstructConfig:
         import torch
         return {
             "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-            "float32": torch.float32,
+            "float16":  torch.float16,
+            "float32":  torch.float32,
         }[self.dtype]
