@@ -127,6 +127,10 @@ def _print_gpu_banner(gpu: dict) -> None:
         unlocked.append("FlashAttention-3 (if installed)")
     elif gpu["is_hopper"]:
         unlocked.append("max-autotune compile")
+    elif gpu["is_ampere"] or gpu["is_ada"]:
+        # A100 SXM: 108 SMs, stable Triton/Inductor, max-autotune is the right mode
+        unlocked.append("max-autotune compile")
+        unlocked.append("TF32 Tensor Cores")
 
     if unlocked:
         print(f"  optimisations  {', '.join(unlocked)}")
@@ -642,10 +646,12 @@ def _wrap_fp8(model):
 
 
 def _should_compile(gpu: dict) -> bool:
-    # sm_120 (Blackwell) has unstable Triton support in current torch/triton builds.
-    # Skip compilation — BF16 eager on 95 GB VRAM is already very fast.
+    # sm_120 (Blackwell consumer) has unstable Triton support — skip.
     if gpu["is_blackwell"]:
         return False
+    # A100 SXM (sm_80, 108 SMs) and L40S (sm_89, 142 SMs) both have
+    # stable Triton/Inductor support. max-autotune is safe and recommended.
+    # Compile is also enabled for Hopper and any other GPU with enough VRAM.
     try:
         major = int(torch.__version__.split(".")[0])
         return (
