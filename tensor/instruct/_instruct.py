@@ -128,12 +128,46 @@ def _print_gpu_banner(gpu: dict) -> None:
     elif gpu["is_hopper"]:
         unlocked.append("max-autotune compile")
     elif gpu["is_ampere"] or gpu["is_ada"]:
-        # A100 SXM: 108 SMs, stable Triton/Inductor, max-autotune is the right mode
+        # A100 SXM (sm_80, 108 SMs) and L40S (sm_89, 142 SMs)
         unlocked.append("max-autotune compile")
         unlocked.append("TF32 Tensor Cores")
 
     if unlocked:
         print(f"  optimisations  {', '.join(unlocked)}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Qwen3 RMSNorm CUDAGraph patch
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _patch_qwen3_rmsnorm() -> bool:
+    """
+    Monkey-patch Qwen3RMSNorm.forward to avoid CUDAGraph tensor overwrites
+    during torch.compile.
+
+    The upstream implementation reassigns the `hidden_states` variable to a
+    float32 cast, which causes CUDAGraphs to overwrite the original input
+    tensor on the backward pass. The fix is to use a separate variable for
+    the float32 intermediate so the original buffer is never touched.
+
+    Returns True if the patch was applied, False if the import failed.
+    """
+    try:
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+
+        def _patched_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            input_dtype = hidden_states.dtype
+            hidden_states_f32 = hidden_states.to(torch.float32)
+            variance = hidden_states_f32.pow(2).mean(-1, keepdim=True)
+            hidden_states_f32 = hidden_states_f32 * torch.rsqrt(
+                variance + self.variance_epsilon
+            )
+            return self.weight * hidden_states_f32.to(input_dtype)
+
+        Qwen3RMSNorm.forward = _patched_forward
+        return True
+    except Exception:
+        return False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -265,9 +299,12 @@ class Instruct:
         _print_gpu_banner(gpu)
         print()
 
-        # ── 2. Enable TF32 for faster matmuls on Ampere / Ada / Hopper / Blackwell
+        # ── 2. Enable TF32 + set matmul precision for Ampere (A100) ──────────
+        # On Ampere (A100 SXM sm_80) this unlocks TF32 Tensor Cores for FP32
+        # matmuls, giving ~10-20% extra throughput with negligible precision loss.
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
         # ── 3. Load tokeniser ──────────────────────────────────────────────
         print("[tensor-instruct] Loading tokenizer …")
@@ -306,11 +343,31 @@ class Instruct:
             model = _wrap_fp8(model)
             fp8_active = True
 
-        # ── 7. Compile model (only on GPUs with enough VRAM) ──────────────
+        # ── 7. Compile model ───────────────────────────────────────────────
+        # Qwen3RMSNorm reassigns `hidden_states` to a float32 cast in-place,
+        # which causes CUDAGraphs to overwrite the original input tensor on
+        # the backward pass. We patch the forward method before compile to
+        # use a separate variable for the float32 intermediate so the
+        # original buffer is never touched. This is detected from config.json
+        # so it works for local paths as well as HF IDs.
+        _model_type = _get_model_type(self._base_model_id)
+        _is_qwen3   = "qwen3" in _model_type
+
         if _should_compile(gpu):
             compile_mode = "max-autotune" if gpu["sm_count"] >= 100 else "reduce-overhead"
-            print(f"[tensor-instruct] Compiling model (mode={compile_mode}) …")
-            model = torch.compile(model, mode=compile_mode)
+
+            if _is_qwen3:
+                patched = _patch_qwen3_rmsnorm()
+                if patched:
+                    print("[tensor-instruct] Applied Qwen3 RMSNorm CUDAGraph patch")
+                else:
+                    print(
+                        "[tensor-instruct] Qwen3 RMSNorm patch failed — skipping compile"
+                    )
+
+            if not _is_qwen3 or patched:
+                print(f"[tensor-instruct] Compiling model (mode={compile_mode}) …")
+                model = torch.compile(model, mode=compile_mode, dynamic=True)
 
         # ── 8. Training arguments ──────────────────────────────────────────
         batch_size = self._config.batch_size_per_device or _auto_batch_size(
@@ -328,7 +385,6 @@ class Instruct:
 
         self._output.mkdir(parents=True, exist_ok=True)
 
-        # Gradient checkpointing only needed when VRAM is tight.
         use_grad_ckpt = True
 
         training_args = TrainingArguments(
@@ -497,6 +553,20 @@ class _ChatMLCollator:
 # Module-level helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _get_model_type(model_id: str) -> str:
+    """
+    Read model_type from config.json.
+    Works for local paths and falls back to the model ID string for HF IDs.
+    """
+    try:
+        config_path = Path(model_id) / "config.json"
+        if config_path.exists():
+            return json.loads(config_path.read_text()).get("model_type", "").lower()
+    except Exception:
+        pass
+    return model_id.lower()
+
+
 def _resolve_base(base: str | Path) -> str:
     raw   = str(base).strip()
     lower = raw.lower()
@@ -628,10 +698,7 @@ def _wrap_fp8(model):
                     te_linear.weight.data.copy_(child.weight.data)
                     if has_bias:
                         te_linear.bias.data.copy_(child.bias.data)
-
-                    # ── cast to match the source layer dtype ──────────────
                     te_linear = te_linear.to(child.weight.dtype)
-
                     setattr(module, name, te_linear)
                 else:
                     replace_linear(child)
@@ -651,7 +718,6 @@ def _should_compile(gpu: dict) -> bool:
         return False
     # A100 SXM (sm_80, 108 SMs) and L40S (sm_89, 142 SMs) both have
     # stable Triton/Inductor support. max-autotune is safe and recommended.
-    # Compile is also enabled for Hopper and any other GPU with enough VRAM.
     try:
         major = int(torch.__version__.split(".")[0])
         return (
@@ -678,7 +744,7 @@ def _auto_batch_size(context_length: int, gpu: dict) -> int:
         if vram_gb >= 64:  return 32
         if vram_gb >= 40:  return 16
         if vram_gb >= 20:  return 8
-        return 2      # was 4 — too aggressive for 16 GB
+        return 2
 
 
 def _check_model_accessible(model_id: str) -> None:
