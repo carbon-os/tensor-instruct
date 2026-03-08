@@ -1,6 +1,6 @@
 # LLM Training Strategies: The Mental Model
 
-There is often confusion between "learning new things" and "learning how to behave." This guide separates the three distinct stages of training, using the **"Brain vs. Glasses"** analogy to clarify when to use which method.
+There is often confusion between "learning new things" and "learning how to behave." This guide separates the distinct stages of training, using the **"Brain vs. Glasses"** analogy to clarify when to use which method.
 
 ---
 
@@ -25,7 +25,7 @@ This is the process of alignment—teaching the model *how* to use the facts it 
 
 * **Goal:** Deep behavioral alignment. Teaching the model to format answers, follow complex logic, and adopt a specific persona.
 * **Mechanism:** Supervised Fine-Tuning (SFT) on Q&A pairs (User/Assistant).
-* **Analogy:** **Brain Surgery.** You are physically rewiring the neural pathways of the brain. You are permanently altering how the model thinks and processes information to make "being helpful" the path of least resistance.
+* **Analogy:** **Brain Surgery.** You are physically rewiring the neural pathways. You are permanently altering how the model thinks to make "being helpful" the path of least resistance.
 * **Best For:**
 * **Small Models (0.5B – 14B):** Small brains need every neuron they have to understand complex instructions. Restricting them with adapters (LoRA) can make them "dumb."
 * **Abundant Compute:** When you have an A100/H100 and the model fits in VRAM easily.
@@ -39,23 +39,27 @@ This is the process of alignment—teaching the model *how* to use the facts it 
 
 **"Putting on Glasses"**
 
-Low-Rank Adaptation (LoRA) freezes the main model and trains tiny "adapter" layers that sit on top of the attention blocks. You only update ~1% of the parameters.
+Low-Rank Adaptation (LoRA) freezes the main model and trains tiny "adapter" layers that sit on top. You only update ~1% of the parameters.
 
-* **Goal:** Efficient behavioral alignment. Getting the model to chat without spending millions on compute.
-* **Mechanism:** SFT on Q&A pairs, but gradients only update the adapter layers.
-* **Analogy:** **Specialized Glasses.** The brain (base model) stays exactly the same—you don't touch it. You just put a pair of glasses on it that distorts the input and output, forcing the model to "see" the world as a helpful assistant.
-* **Best For:**
-* **Massive Models (70B+):** You physically cannot fit the gradients of a 70B model on a single GPU. LoRA is the only option.
-* **Safety:** You cannot "break" the base model because you aren't touching it. If the LoRA is bad, just take the glasses off.
+* **Goal:** Efficient alignment without high compute costs.
+* **Analogy:** **Specialized Glasses.** The brain (base model) stays exactly the same. You put a pair of glasses on it that distorts the input and output, forcing the model to "see" the world as a helpful assistant.
 
+### The LoRA Hierarchy (Ranked by Power)
 
-* **Trade-off:** Lower capacity. You are asking the model to learn a new behavior using only 1% of its brain power.
+If you *must* use LoRA (e.g., for huge 70B+ models), use the best version available.
+
+| Variant | Analogy | Description | Recommendation |
+| --- | --- | --- | --- |
+| **1. DoRA** (Weight-Decomposed) | **High-Tech Corrective Lenses** | Separates weight *magnitude* from *direction*. Mathematically closest to Full Fine-Tuning. | **Best LoRA.** Use this for 70B+ models if you want max quality. |
+| **2. LoRA+** (Plus) | **Polished Glasses** | A hack that sets the learning rate of Matrix B 16x higher than Matrix A. | **Fast & Easy.** Better than standard LoRA, zero cost to implement. |
+| **3. LoRA** (Standard) | **Standard Glasses** | The vanilla adapter method. Reliable, widely supported. | **Baseline.** Use if DoRA isn't supported by your tools. |
+| **4. QLoRA** (Quantized) | **Budget Glasses** | Crushes the base model to 4-bit precision to save RAM. | **Emergency Only.** Use only if you physically cannot fit the model otherwise. Slightly degrades quality. |
 
 ---
 
 ## Summary Comparison
 
-| Feature | Continued Pre-training | Full Fine-Tuning (FFT) | LoRA Fine-Tuning |
+| Feature | Continued Pre-training | Full Fine-Tuning (FFT) | LoRA / DoRA |
 | --- | --- | --- | --- |
 | **Primary Goal** | **Knowledge** (Facts) | **Behavior** (Deep Habits) | **Behavior** (Surface Bias) |
 | **Analogy** | Reading a Textbook | Brain Surgery | Specialized Glasses |
@@ -66,7 +70,7 @@ Low-Rank Adaptation (LoRA) freezes the main model and trains tiny "adapter" laye
 
 ---
 
-## The Decision Matrix: What should I use?
+## The Decision Matrix
 
 ### Scenario A: "I want the model to know about my company's internal API."
 
@@ -80,5 +84,5 @@ Low-Rank Adaptation (LoRA) freezes the main model and trains tiny "adapter" laye
 
 ### Scenario C: "I want to make Llama-3-70B summarize news articles."
 
-* **Strategy:** **LoRA.**
-* *Reason:* A 70B model is brilliant but huge. You can't fine-tune it fully without 8x H100s. LoRA allows you to do it on a smaller setup, and the base model is smart enough that "glasses" are all it needs.
+* **Strategy:** **DoRA (or LoRA).**
+* *Reason:* A 70B model is brilliant but huge. You can't fine-tune it fully without 8x H100s. DoRA allows you to do it on a smaller setup, and the base model is smart enough that "glasses" are all it needs.
