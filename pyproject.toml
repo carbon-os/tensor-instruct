@@ -33,6 +33,9 @@ dependencies = [
     "huggingface_hub>=0.22.0",
     "safetensors>=0.4.0",
     "tqdm>=4.66.0",
+    "sentencepiece>=0.2.0",
+    "protobuf>=4.25.0",
+    "tiktoken>=0.7.0",
 ]
 
 [project.optional-dependencies]
@@ -52,9 +55,8 @@ Documentation = "https://github.com/carbon-os/tensor-instruct#readme"
 Repository    = "https://github.com/carbon-os/tensor-instruct"
 Issues        = "https://github.com/carbon-os/tensor-instruct/issues"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["tensor*"]
+[tool.setuptools]
+packages = ["tensor", "tensor.instruct", "tensor.instruct.data"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]

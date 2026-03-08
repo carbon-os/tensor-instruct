@@ -13,8 +13,23 @@ Labels are set to -100 (ignored by cross-entropy) on every token that is
 NOT part of an assistant turn. The model only learns to produce assistant
 responses — it never receives a gradient signal from system or user tokens.
 
+Memory management
+-----------------
+Examples are streamed one at a time through ``Dataset.from_generator`` —
+nothing is materialised into Python heap. A safe ``max_examples`` cap is
+auto-derived from available system RAM unless explicitly overridden in
+``InstructConfig``.
+
+    Available RAM   Auto cap
+    ─────────────   ────────
+    < 8 GB          10,000
+    < 16 GB         25,000
+    < 32 GB         50,000
+    < 64 GB         150,000
+    ≥ 64 GB         unlimited
+
 ChatML format expected per example
------------------------------------
+------------------------------------
     {"messages": [
         {"role": "system",    "content": "You are a helpful assistant."},
         {"role": "user",      "content": "What is gradient descent?"},
@@ -43,6 +58,40 @@ _IGNORE_INDEX = -100
 
 
 # ---------------------------------------------------------------------------
+# Memory-aware cap
+# ---------------------------------------------------------------------------
+
+def _auto_max_examples() -> int | None:
+    """
+    Derive a safe example cap from available system RAM.
+
+    Returns ``None`` (unlimited) when RAM is large enough that capping
+    would be unnecessarily restrictive. The thresholds are conservative —
+    each tokenised example is roughly 4–8 KB in Arrow format, so even
+    150k examples sits comfortably under 2 GB of dataset memory.
+    """
+    try:
+        import psutil
+        available_gb = psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        # psutil unavailable — apply a safe default.
+        return 25_000
+
+    if available_gb < 8:
+        cap = 10_000
+    elif available_gb < 16:
+        cap = 25_000
+    elif available_gb < 32:
+        cap = 50_000
+    elif available_gb < 64:
+        cap = 150_000
+    else:
+        return None  # unlimited
+
+    return cap
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -50,6 +99,7 @@ def build_instruct_dataset(
     sources: dict,
     tokenizer,
     context_length: int,
+    max_examples: int | None = "auto",
     seed: int = 42,
 ):
     """
@@ -59,12 +109,14 @@ def build_instruct_dataset(
     ----------
     sources:
         A ``dict[source, weight]`` mapping (already normalised by Mix).
-        Weights influence how many examples are sampled from each source
-        relative to the others.
     tokenizer:
         A HuggingFace tokeniser.
     context_length:
-        Maximum tokens per example.  Longer conversations are truncated.
+        Maximum tokens per example. Longer conversations are truncated.
+    max_examples:
+        ``"auto"``  — derive cap from available RAM (default).
+        ``None``    — no cap, use all examples (only safe on high-RAM machines).
+        ``int``     — explicit cap, e.g. ``10_000``.
     seed:
         Shuffle seed.
 
@@ -73,69 +125,71 @@ def build_instruct_dataset(
     dataset:
         HuggingFace ``Dataset`` with ``input_ids`` and ``labels`` columns.
     stats:
-        Dict with ``total``, ``kept``, and ``truncated`` example counts.
+        Dict with ``total``, ``kept``, ``truncated``, and ``skipped`` counts.
     """
     import datasets as hf_datasets
-    import random
 
-    print("[tensor-instruct] Building tokenised dataset …")
+    # Resolve max_examples.
+    if max_examples == "auto":
+        resolved_cap = _auto_max_examples()
+    else:
+        resolved_cap = max_examples  # None or explicit int
 
-    all_input_ids: list[list[int]] = []
-    all_labels:    list[list[int]] = []
+    if resolved_cap is not None:
+        print(
+            f"[tensor-instruct] Building tokenised dataset …  "
+            f"(cap: {resolved_cap:,} examples)"
+        )
+    else:
+        print("[tensor-instruct] Building tokenised dataset …  (cap: unlimited)")
 
     stats = {"total": 0, "kept": 0, "truncated": 0, "skipped": 0}
 
-    # Collect all examples across sources, weighted by sample count.
-    # For instruct fine-tuning we work example-by-example rather than
-    # streaming a flat token array.
-    source_batches: list[list[dict]] = []
-    weights: list[float] = []
-
+    # Log sources before entering the generator so the output appears
+    # immediately rather than only when the first example is consumed.
     for source, weight in sources.items():
-        examples = list(_iter_source_examples(source))
-        source_batches.append(examples)
-        weights.append(weight)
-        print(f"  → {source!r}  ({len(examples):,} examples, weight {weight:.2f})")
+        print(f"  → {source!r}  (weight {weight:.2f})")
 
-    # Interleave sources according to their weights.
-    merged = _weighted_merge(source_batches, weights, seed=seed)
+    def generate_examples():
+        for source, weight in sources.items():
+            for example in _iter_source_examples(source):
+                if resolved_cap is not None and stats["kept"] >= resolved_cap:
+                    return
 
-    for example in tqdm(merged, desc="  Tokenising", unit="ex", leave=False):
-        stats["total"] += 1
-        messages = example.get("messages")
+                stats["total"] += 1
+                messages = example.get("messages")
 
-        if not messages or not isinstance(messages, list):
-            stats["skipped"] += 1
-            continue
+                if not messages or not isinstance(messages, list):
+                    stats["skipped"] += 1
+                    continue
 
-        result = _tokenize_conversation(messages, tokenizer, context_length)
-        if result is None:
-            stats["skipped"] += 1
-            continue
+                result = _tokenize_conversation(messages, tokenizer, context_length)
+                if result is None:
+                    stats["skipped"] += 1
+                    continue
 
-        if result["truncated"]:
-            stats["truncated"] += 1
+                if result["truncated"]:
+                    stats["truncated"] += 1
 
-        all_input_ids.append(result["input_ids"])
-        all_labels.append(result["labels"])
-        stats["kept"] += 1
+                stats["kept"] += 1
+                yield {
+                    "input_ids": result["input_ids"],
+                    "labels":    result["labels"],
+                }
 
-    if not all_input_ids:
+    dataset = hf_datasets.Dataset.from_generator(generate_examples)
+
+    if not len(dataset):
         raise RuntimeError(
             "No valid training examples were produced from the provided sources.\n"
             "Check that your JSONL files contain the expected "
-            '{"messages": [{...}]} schema.'
+            '{"messages": [{"role": ..., "content": ...}, ...]} schema.'
         )
 
     print(
         f"  ✓ {stats['kept']:,} examples kept  "
         f"({stats['truncated']:,} truncated, {stats['skipped']:,} skipped)"
     )
-
-    dataset = hf_datasets.Dataset.from_dict({
-        "input_ids": all_input_ids,
-        "labels":    all_labels,
-    })
 
     return dataset, stats
 
@@ -150,7 +204,7 @@ def estimate_example_count(sources: dict) -> int:
     total = 0
     for source in sources:
         if isinstance(source, LocalSource):
-            total += sum(1 for _ in source.iter_examples())
+            total += source.example_count()
     return total
 
 
@@ -179,14 +233,14 @@ def _tokenize_conversation(
         if not role or content is None:
             continue
 
-        # ── encode each segment separately so we can mask precisely ──────
+        # Encode each segment separately so we can mask precisely.
         header_ids  = _encode(tokenizer, f"{_IM_START}{role}\n")
         content_ids = _encode(tokenizer, content)
         footer_ids  = _encode(tokenizer, f"{_IM_END}\n")
 
         if role in _TRAIN_ROLES:
-            # Compute loss on the content and the closing <|im_end|> token.
-            # The header is context the model already sees — no gradient there.
+            # Compute loss on content and closing <|im_end|>.
+            # Header is context — no gradient.
             input_ids.extend(header_ids + content_ids + footer_ids)
             labels.extend(
                 [_IGNORE_INDEX] * len(header_ids)
@@ -202,16 +256,15 @@ def _tokenize_conversation(
     if not input_ids:
         return None
 
-    # Check we have at least one trainable token before truncating.
-    has_trainable = any(l != _IGNORE_INDEX for l in labels)
-    if not has_trainable:
+    # Must have at least one trainable token before truncation.
+    if not any(l != _IGNORE_INDEX for l in labels):
         return None
 
     truncated = len(input_ids) > context_length
     input_ids = input_ids[:context_length]
     labels    = labels[:context_length]
 
-    # After truncation it's possible the trainable tokens were all cut off.
+    # After truncation all trainable tokens may have been cut off.
     if all(l == _IGNORE_INDEX for l in labels):
         return None
 
@@ -255,73 +308,12 @@ def _iter_hub_examples(source) -> Iterator[dict]:
     for row in ds:
         messages = row.get(col)
         if messages:
-            # Normalise role names if a mapping is provided.
             if source.role_mapping:
                 messages = [
                     {
-                        "role": source.role_mapping.get(m["role"], m["role"]),
+                        "role":    source.role_mapping.get(m["role"], m["role"]),
                         "content": m.get("content", ""),
                     }
                     for m in messages
                 ]
             yield {"messages": messages}
-
-
-# ---------------------------------------------------------------------------
-# Weighted merge
-# ---------------------------------------------------------------------------
-
-def _weighted_merge(
-    batches: list[list[dict]],
-    weights: list[float],
-    seed: int,
-) -> list[dict]:
-    """
-    Interleave examples from multiple sources proportionally to their weights.
-
-    For simplicity we materialise all examples and then interleave by
-    sampling without replacement according to the weight ratios.
-    """
-    import random
-
-    if len(batches) == 1:
-        result = list(batches[0])
-        random.Random(seed).shuffle(result)
-        return result
-
-    # Find the target total size (sum of all examples).
-    total = sum(len(b) for b in batches)
-
-    # Build the merged list by round-robin weighted selection.
-    rng = random.Random(seed)
-    iters = [iter(b) for b in batches]
-    exhausted = [False] * len(batches)
-    buffers: list[list[dict]] = [list(b) for b in batches]
-    for buf in buffers:
-        rng.shuffle(buf)
-
-    result: list[dict] = []
-    indices = list(range(len(batches)))
-
-    while not all(exhausted):
-        live   = [i for i in indices if not exhausted[i]]
-        w      = [weights[i] for i in live]
-        total_w = sum(w)
-        probs  = [wi / total_w for wi in w]
-
-        # Pick a source proportionally.
-        r = rng.random()
-        cumulative = 0.0
-        chosen = live[0]
-        for idx, p in zip(live, probs):
-            cumulative += p
-            if r <= cumulative:
-                chosen = idx
-                break
-
-        if buffers[chosen]:
-            result.append(buffers[chosen].pop())
-        else:
-            exhausted[chosen] = True
-
-    return result
