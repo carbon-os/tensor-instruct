@@ -123,10 +123,10 @@ def _print_gpu_banner(gpu: dict) -> None:
     unlocked = []
     if gpu["has_fp8"]:
         unlocked.append("FP8 training")
-    if gpu["is_blackwell"] or gpu["is_hopper"]:
-        unlocked.append("max_autotune compile")
     if gpu["is_blackwell"]:
         unlocked.append("FlashAttention-3 (if installed)")
+    elif gpu["is_hopper"]:
+        unlocked.append("max-autotune compile")
 
     if unlocked:
         print(f"  optimisations  {', '.join(unlocked)}")
@@ -304,7 +304,7 @@ class Instruct:
 
         # ── 7. Compile model (only on GPUs with enough VRAM) ──────────────
         if _should_compile(gpu):
-            compile_mode = "max_autotune" if gpu["sm_count"] >= 100 else "reduce-overhead"
+            compile_mode = "max-autotune" if gpu["sm_count"] >= 100 else "reduce-overhead"
             print(f"[tensor-instruct] Compiling model (mode={compile_mode}) …")
             model = torch.compile(model, mode=compile_mode)
 
@@ -325,7 +325,7 @@ class Instruct:
         self._output.mkdir(parents=True, exist_ok=True)
 
         # Gradient checkpointing only needed when VRAM is tight.
-        use_grad_ckpt = gpu["free_vram_gb"] < 40
+        use_grad_ckpt = True
 
         training_args = TrainingArguments(
             output_dir=str(self._output),
@@ -624,6 +624,10 @@ def _wrap_fp8(model):
                     te_linear.weight.data.copy_(child.weight.data)
                     if has_bias:
                         te_linear.bias.data.copy_(child.bias.data)
+
+                    # ── cast to match the source layer dtype ──────────────
+                    te_linear = te_linear.to(child.weight.dtype)
+
                     setattr(module, name, te_linear)
                 else:
                     replace_linear(child)
@@ -638,12 +642,10 @@ def _wrap_fp8(model):
 
 
 def _should_compile(gpu: dict) -> bool:
-    """
-    Only compile when CUDA is available, PyTorch >= 2.0, and there is
-    enough VRAM that CUDA graph private pools won't cause OOM.
-    Cards below 20 GB should skip compilation — the memory overhead of
-    CUDA graphs eats into already tight headroom.
-    """
+    # sm_120 (Blackwell) has unstable Triton support in current torch/triton builds.
+    # Skip compilation — BF16 eager on 95 GB VRAM is already very fast.
+    if gpu["is_blackwell"]:
+        return False
     try:
         major = int(torch.__version__.split(".")[0])
         return (
@@ -659,9 +661,7 @@ def _auto_batch_size(context_length: int, gpu: dict) -> int:
     vram_gb = gpu["free_vram_gb"]
 
     if context_length >= 8192:
-        if vram_gb >= 64:  return 8
-        if vram_gb >= 40:  return 4
-        if vram_gb >= 20:  return 2
+        if vram_gb >= 64:  return 4
         return 1
     elif context_length >= 4096:
         if vram_gb >= 64:  return 16

@@ -39,6 +39,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# FlashAttention-2 — must be installed AFTER torch:
+#   pip install -e ".[flash-attn]" --no-build-isolation
 flash-attn = [
     "flash-attn>=2.5.0",
 ]
@@ -47,13 +49,16 @@ fp8 = [
     "transformer-engine>=1.7.0",
 ]
 # Blackwell: FlashAttention-3 (experimental, requires CUDA 12.3+)
+# Install AFTER torch:
+#   pip install -e ".[flash-attn-3]" --no-build-isolation
 flash-attn-3 = [
     "flash-attn-3>=0.0.1",
 ]
-# Everything at once for a Pro 6000 / H100 box
+# Pro 6000 / H100 base install (no flash-attn — install that separately):
+#   pip install -e ".[blackwell]"
+#   pip install flash-attn --no-build-isolation
 blackwell = [
     "transformer-engine>=1.7.0",
-    "flash-attn>=2.5.0",
 ]
 dev = [
     "pytest>=8.0.0",

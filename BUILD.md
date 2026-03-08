@@ -25,34 +25,95 @@ cd tensor-instruct
 
 ---
 
-## 2. Set Up Environment
+## 2. Install Conda (Miniconda)
 
-Create and activate a virtual environment first — this keeps the heavy ML
-dependencies isolated.
 ```bash
-python -m venv .venv
-source .venv/bin/activate        # Linux / macOS
-# .venv\Scripts\activate         # Windows
+curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o miniconda.sh
+bash miniconda.sh -b -p $HOME/miniconda
+$HOME/miniconda/bin/conda init bash
+source ~/.bashrc
+```
+
+Verify:
+```bash
+conda --version
 ```
 
 ---
 
-## 3. Install
+## 3. Set Up Environment
 
-### Standard install (recommended)
+Always create a dedicated conda environment — never install into `base` as it
+is reserved for conda's own tooling and will cause conflicts.
+
+```bash
+conda create -n tensor python=3.12 -y
+conda activate tensor
+```
+
+---
+
+## 4. Install
+
+### Standard install
 ```bash
 pip install --upgrade pip setuptools
 pip install -e .
-
-OR
-
-# RTX Pro 6000
-pip install -e ".[blackwell]"
-
 ```
 
-The `-e` flag installs in editable mode — changes to the source files take
-effect immediately without reinstalling.
+### RTX Pro 6000 / Blackwell (full stack)
+
+**Step 1 — base install:**
+```bash
+pip install -e ".[blackwell]"
+```
+
+**Step 2 — install PyTorch 2.10 with CUDA 12.8:**
+```bash
+pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+```
+
+**Step 3 — set CUDA paths (required for Triton and TE):**
+```bash
+export CUDA_HOME=/usr/local/cuda
+echo 'export CUDA_HOME=/usr/local/cuda' >> ~/.bashrc
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+echo 'export PYTORCH_ALLOC_CONF=expandable_segments:True' >> ~/.bashrc
+```
+
+**Step 4 — build Transformer Engine from source against your torch:**
+```bash
+pip install ninja
+MAX_JOBS=$(nproc) pip install --no-build-isolation "transformer-engine[pytorch]"
+```
+This takes 5–30 minutes depending on CPU core count. It must be built from
+source to match the torch ABI — conda prebuilts are tied to older torch versions
+and will cause undefined symbol errors at runtime.
+
+**Step 5 — install FlashAttention-2 (prebuilt, no compilation):**
+```bash
+pip install "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+```
+
+> To build flash-attn from source instead (10–45 min):
+> ```bash
+> MAX_JOBS=$(nproc) pip install flash-attn --no-build-isolation
+> ```
+
+**Step 6 — verify the full stack:**
+```bash
+python3 -c "
+import torch
+import transformer_engine.pytorch as te
+print('torch:', torch.__version__)
+print('GPU:', torch.cuda.get_device_name(0))
+print('TE OK')
+"
+```
+
+```bash
+python3 -c "import flash_attn; print('FA2 OK:', flash_attn.__version__)"
+```
 
 ### With FlashAttention-2 (A100 / H100, faster training)
 ```bash
@@ -69,7 +130,64 @@ python -c "from tensor.instruct import Instruct, InstructConfig; print('OK')"
 
 ---
 
-## 4. HuggingFace Authentication
+## 5. Known Issues and Fixes (RTX Pro 6000 / Blackwell sm_120)
+
+These patches are required in `tensor/instruct/_instruct.py` for stable
+training on Blackwell. Apply them once after cloning.
+
+**Fix 1 — disable torch.compile on Blackwell (Triton sm_120 support is unstable):**
+```python
+def _should_compile(gpu: dict) -> bool:
+    if gpu["is_blackwell"]:
+        return False
+    try:
+        major = int(torch.__version__.split(".")[0])
+        return (
+            major >= 2
+            and torch.cuda.is_available()
+            and gpu["free_vram_gb"] >= 20
+        )
+    except Exception:
+        return False
+```
+
+**Fix 2 — correct compile mode string (hyphen not underscore):**
+```python
+compile_mode = "max-autotune" if gpu["sm_count"] >= 100 else "reduce-overhead"
+```
+
+**Fix 3 — always use gradient checkpointing (required at 8192 context):**
+```python
+use_grad_ckpt = True
+```
+
+**Fix 4 — reduce batch size for 8192 context on high-VRAM cards:**
+```python
+if context_length >= 8192:
+    if vram_gb >= 64:  return 4
+```
+
+**Fix 5 — cast FP8 Linear layers to match model dtype:**
+
+In `_wrap_fp8`, after the bias copy add:
+```python
+te_linear = te_linear.to(child.weight.dtype)
+```
+
+**Fix 6 — remove max_autotune from Blackwell optimisations banner:**
+```python
+    unlocked = []
+    if gpu["has_fp8"]:
+        unlocked.append("FP8 training")
+    if gpu["is_blackwell"]:
+        unlocked.append("FlashAttention-3 (if installed)")
+    elif gpu["is_hopper"]:
+        unlocked.append("max-autotune compile")
+```
+
+---
+
+## 6. HuggingFace Authentication
 
 Some base models on HuggingFace Hub are gated. If your base is a local
 `tensor-pretrain` checkpoint you can skip this step entirely.
@@ -88,7 +206,7 @@ export HF_TOKEN=hf_...
 
 ---
 
-## 5. File Structure
+## 7. File Structure
 
 After cloning and installing the structure should look like this:
 ```
@@ -113,7 +231,7 @@ tensor-instruct/
 
 ---
 
-## 6. Prepare Your Data
+## 8. Prepare Your Data
 
 `tensor-instruct` expects data in **ChatML format**. Each line of your
 `.jsonl` file is one conversation:
@@ -131,7 +249,7 @@ Rules:
 
 ---
 
-## 7. Your First Training Run
+## 9. Your First Training Run
 ```python
 from tensor.instruct import Instruct
 
@@ -155,7 +273,7 @@ python train.py
 
 ---
 
-## 8. Common Configurations
+## 10. Common Configurations
 
 ### Local JSONL, single file
 ```python
@@ -269,7 +387,7 @@ run.train()
 
 ---
 
-## 9. Multi-GPU with torchrun
+## 11. Multi-GPU with torchrun
 
 For 2+ GPU runs, `torchrun` handles process spawning automatically.
 `tensor-instruct` picks up the distributed environment through the
@@ -282,7 +400,7 @@ Set `devices=` in `InstructConfig` to match `--nproc_per_node`.
 
 ---
 
-## 10. Output
+## 12. Output
 
 After `train()` completes the output directory contains:
 ```
@@ -301,25 +419,46 @@ Load it anywhere `from_pretrained` is accepted, or pass it directly to
 
 ---
 
-## 11. Troubleshooting
+## 13. Troubleshooting
 
 **`BaseModelError` at startup**
 You passed an instruct or chat model. Switch to the base variant — remove
-the `-Instruct`, `-it`, `-Chat`, or `-sft` suffix. If you want to fine-tune
-on top of a `tensor-pretrain` output, pass the local path to the checkpoint
-directory instead.
+the `-Instruct`, `-it`, `-Chat`, or `-sft` suffix.
 
 **`RuntimeError: No valid training examples were produced`**
 Your JSONL data either doesn't parse or doesn't match the expected schema.
-Run `run.validate()` first — it will print the example count per source.
-Make sure every line has a top-level `messages` key and at least one
-`assistant` turn.
+Run `run.validate()` first. Make sure every line has a top-level `messages`
+key and at least one `assistant` turn.
 
 **`CUDA out of memory`**
 Reduce `batch_size_per_device` or `context_length` in `InstructConfig`.
 For a 16GB GPU try `batch_size_per_device=1, context_length=1024`.
-Gradient checkpointing is always enabled — this is already the main
-memory-saving lever.
+Gradient checkpointing is always enabled.
+
+**`FP8 wrap failed — undefined symbol`**
+Transformer Engine was installed from conda and mismatches your pip torch ABI.
+Reinstall TE from source:
+```bash
+pip uninstall transformer-engine transformer-engine-torch -y
+pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+MAX_JOBS=$(nproc) pip install --no-build-isolation "transformer-engine[pytorch]"
+```
+
+**`RemoveError: 'setuptools' is a dependency of conda`**
+You are trying to install into the `base` conda environment. Always use a
+dedicated environment:
+```bash
+conda create -n tensor python=3.12 -y
+conda activate tensor
+```
+
+**`RuntimeError: Unrecognized mode=max_autotune`**
+The compile mode string uses a hyphen not an underscore. See Fix 2 in
+section 5.
+
+**`CUDA error: an illegal memory access` during autotuning**
+Triton autotuning is unstable on Blackwell sm_120. Apply Fix 1 in section 5
+to disable `torch.compile` on Blackwell entirely.
 
 **`huggingface_hub.errors.RepositoryNotFoundError`**
 The model is gated. Run `huggingface-cli login` and accept the model
@@ -331,11 +470,4 @@ Your GPU does not support bf16 (requires Ampere or newer). Switch to
 
 **All examples skipped, 0 kept**
 Every line in your JSONL either has no `assistant` turn, has fewer than
-two messages, or is malformed JSON. Check that your data follows the
-schema in section 6.
-
----
-
-## License
-
-Apache 2.0 — free for commercial and private use within the Tensor Framework ecosystem.
+two messages, or is malformed JSON. Check the schema in section 8.
