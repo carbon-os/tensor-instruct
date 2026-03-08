@@ -6,3 +6,4 @@ __pycache__/
 .venv/
 
 tensor_instruct.egg-info/
+=2.5.0

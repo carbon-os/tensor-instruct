@@ -77,7 +77,7 @@ pip install -e .
 
 ### With FlashAttention-2 (A100 SXM / L40S — recommended)
 ```bash
-pip install -e ".[flash-attn]"
+pip install "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 ```
 
 FlashAttention-2 is fully supported and stable on both the A100 SXM and L40S.
