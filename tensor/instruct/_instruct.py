@@ -67,7 +67,7 @@ class Instruct:
     ----------
     base:
         Local path to a ``tensor-pretrain`` checkpoint, or a HuggingFace
-        base model ID (e.g. ``"Qwen/Qwen3-8B-Base"``).
+        base model ID (e.g. ``"Qwen/Qwen3-0.6B-Base"``).
         Instruct/chat variants raise :class:`BaseModelError`.
     data:
         Training data.  Accepts:
@@ -89,11 +89,11 @@ class Instruct:
         output: str | Path,
         config: InstructConfig | None = None,
     ) -> None:
-        self._base_input   = str(base)
+        self._base_input    = str(base)
         self._base_model_id = _resolve_base(base)   # raises BaseModelError early
-        self._data         = _normalise_data(data)
-        self._output       = Path(output).expanduser().resolve()
-        self._config       = config or InstructConfig()
+        self._data          = _normalise_data(data)
+        self._output        = Path(output).expanduser().resolve()
+        self._config        = config or InstructConfig()
         self._result: InstructResult | None = None
 
     # ------------------------------------------------------------------
@@ -156,12 +156,12 @@ class Instruct:
 
         print("[tensor-instruct] Estimating …")
 
-        tokenizer = _load_tokenizer(self._base_model_id)
+        tokenizer      = _load_tokenizer(self._base_model_id)
         context_length = _resolve_context_length(self._config, tokenizer)
-        devices = self._config.resolve_devices()
+        devices        = self._config.resolve_devices()
 
         n_examples = estimate_example_count(self._data)
-        est_time = _estimate_wall_time(
+        est_time   = _estimate_wall_time(
             n_examples, self._config.epochs, devices, self._base_model_id
         )
 
@@ -198,7 +198,7 @@ class Instruct:
 
         # ── 1. Load tokeniser ──────────────────────────────────────────────
         print("[tensor-instruct] Loading tokenizer …")
-        tokenizer = _load_tokenizer(self._base_model_id)
+        tokenizer      = _load_tokenizer(self._base_model_id)
         context_length = _resolve_context_length(self._config, tokenizer)
         print(f"  context length: {context_length} tokens")
 
@@ -207,25 +207,24 @@ class Instruct:
             sources=self._data,
             tokenizer=tokenizer,
             context_length=context_length,
+            max_examples=self._config.max_examples,
             seed=self._config.seed,
         )
 
         # ── 3. Load model ──────────────────────────────────────────────────
         print(f"\n[tensor-instruct] Loading base model ({self._base_model_id}) …")
-        devices    = self._config.resolve_devices()
+        devices     = self._config.resolve_devices()
         torch_dtype = self._config.resolve_dtype_torch()
-        attn_impl  = _pick_attention_impl()
+        attn_impl   = _pick_attention_impl()
 
         model = AutoModelForCausalLM.from_pretrained(
             self._base_model_id,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             attn_implementation=attn_impl,
             trust_remote_code=False,
         )
 
         # Ensure ChatML special tokens exist in the vocab.
-        # This is a no-op for Qwen3 (they ship with them); it's a safety net
-        # for other base models.
         tokenizer, model = _ensure_chatml_tokens(tokenizer, model)
 
         # ── 4. Training arguments ──────────────────────────────────────────
@@ -353,17 +352,18 @@ class Instruct:
             "base_input":    self._base_input,
             "base_model_id": self._base_model_id,
             "config": {
-                "epochs":                    self._config.epochs,
-                "devices":                   self._config.devices,
-                "dtype":                     self._config.dtype,
-                "context_length":            self._config.context_length,
-                "batch_size_per_device":     self._config.batch_size_per_device,
+                "epochs":                      self._config.epochs,
+                "max_examples":                self._config.max_examples,
+                "devices":                     self._config.devices,
+                "dtype":                       self._config.dtype,
+                "context_length":              self._config.context_length,
+                "batch_size_per_device":       self._config.batch_size_per_device,
                 "gradient_accumulation_steps": self._config.gradient_accumulation_steps,
-                "learning_rate":             self._config.learning_rate,
-                "warmup_ratio":              self._config.warmup_ratio,
-                "save_steps":                self._config.save_steps,
-                "logging_steps":             self._config.logging_steps,
-                "seed":                      self._config.seed,
+                "learning_rate":               self._config.learning_rate,
+                "warmup_ratio":                self._config.warmup_ratio,
+                "save_steps":                  self._config.save_steps,
+                "logging_steps":               self._config.logging_steps,
+                "seed":                        self._config.seed,
             },
             "data": _serialise_data(self._data),
         }
@@ -420,7 +420,7 @@ def _resolve_base(base: str | Path) -> str:
     Accepts a local path (tensor-pretrain checkpoint) or a HuggingFace ID.
     Raises :class:`BaseModelError` if an instruct variant is detected.
     """
-    raw = str(base).strip()
+    raw   = str(base).strip()
     lower = raw.lower()
 
     for suffix in _INSTRUCT_SUFFIXES:
@@ -431,7 +431,7 @@ def _resolve_base(base: str | Path) -> str:
                 "Use the base variant, or a checkpoint produced by tensor-pretrain."
             )
 
-    # Local path — return as-is (tensor-pretrain outputs are always raw bases).
+    # Local path — return as-is.
     if Path(raw).exists():
         return raw
 
@@ -454,6 +454,20 @@ def _normalise_data(data: _DataArg) -> dict:
 
 def _load_tokenizer(model_id: str):
     from transformers import AutoTokenizer
+
+    # For local checkpoints, verify tokenizer.json is present.
+    p = Path(model_id)
+    if p.exists():
+        tokenizer_file = p / "tokenizer.json"
+        if not tokenizer_file.exists():
+            raise FileNotFoundError(
+                f"No tokenizer.json found in local checkpoint: {p}\n"
+                "This usually means the tensor-pretrain run did not complete "
+                "cleanly and the tokenizer was never saved.\n"
+                "Re-run tensor-pretrain, or copy the tokenizer files from the "
+                "original upstream base model into this directory."
+            )
+
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=False)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -466,10 +480,8 @@ def _ensure_chatml_tokens(tokenizer, model):
     embedding table if the tokens are not already present.
 
     For Qwen3-based models this is a no-op — they ship with these tokens.
-    For other bases, this guarantees the ChatML delimiter tokens have
-    dedicated embeddings rather than being split into subwords.
     """
-    vocab = tokenizer.get_vocab()
+    vocab   = tokenizer.get_vocab()
     missing = [t for t in _CHATML_TOKENS if t not in vocab]
     if missing:
         tokenizer.add_special_tokens({"additional_special_tokens": missing})
@@ -526,7 +538,6 @@ def _auto_batch_size(context_length: int, devices: int) -> int:
 
 
 def _check_model_accessible(model_id: str) -> None:
-    # Local path — just check it exists.
     p = Path(model_id)
     if p.exists():
         if not (p / "config.json").exists():
@@ -536,8 +547,6 @@ def _check_model_accessible(model_id: str) -> None:
                 "Make sure this is a valid tensor-pretrain output."
             )
         return
-
-    # HuggingFace ID.
     try:
         from huggingface_hub import model_info
         model_info(model_id)
@@ -572,14 +581,9 @@ def _estimate_wall_time(
     devices: int,
     model_id: str,
 ) -> str:
-    """
-    Rough wall-time estimate for instruct fine-tuning.
-    Baseline: A100 at ~2,000 examples/hr for a 7B model at context 2048.
-    """
     if n_examples == 0:
         return "unknown (could not count examples — Hub sources not sampled)"
 
-    # Try to infer param count for scaling.
     param_b = 7.0
     try:
         from transformers import AutoConfig as HFAutoConfig
@@ -590,7 +594,7 @@ def _estimate_wall_time(
     except Exception:
         pass
 
-    base_examples_per_hr = max(500, 2_000 * (7 / max(param_b, 0.1)))
+    base_examples_per_hr  = max(500, 2_000 * (7 / max(param_b, 0.1)))
     total_examples_per_hr = base_examples_per_hr * devices
     hours = (n_examples * epochs) / total_examples_per_hr
 
